@@ -14,10 +14,15 @@ estático, numa base de dados carregada de um CSV em memória (sem banco).
 
 ```
 docker build -t ciframe .
-docker run -p 8080:8080 ciframe
+docker run -v ciframe-instance:/app/instance -p 8080:8080 ciframe
 ```
 
 Acesse [http://localhost:8080](http://localhost:8080).
+
+O catálogo de sequências customizadas fica em um SQLite em
+`/app/instance/sequences.db` (configurável pela variável `SEQUENCES_DB`). O
+volume `ciframe-instance` preserva esse catálogo quando o container é recriado;
+sem o volume, ele sobrevive apenas a reinícios do processo.
 
 ### Com virtualenv
 

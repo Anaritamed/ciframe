@@ -1,10 +1,13 @@
 # coding: utf-8
 import json
-from flask import Flask, request
+import logging
+import os
+from flask import Flask, g, request
 import sys
 from musica import *
 from collections import OrderedDict
 import unicodedata
+import sequences
 
 app = Flask(__name__)
 
@@ -37,12 +40,6 @@ TAM_PAGINA = 100
 genero_musicas = {}
 generos = set()
 acordes = set()
-sequencias = {'BmGDA' : 0,
-        'CGAmF' : 1,
-        'EmG' : 2,
-        'CA7DmG7' : 3,
-        'GmF' : 4,
-        'CC7FFm' : 5}
 
 musicas_dict = {}
 
@@ -88,14 +85,41 @@ for line in f:
 musicas = OrderedDict(sorted(musicas_dict.items(),
     key=lambda x: x[1].popularidade, reverse = True))
 
-# para trabalhar melhor com json
-generos = list(generos)
+# para trabalhar melhor com json (ordem determinística entre processos)
+generos = sorted(generos)
 
 # ordena genero_musicas por popularidade
 for k,v in genero_musicas.items():
     genero_musicas[k].sort(key = lambda x : x.popularidade, reverse = True)
 
 f.close()
+
+# Catálogo de sequências: SQLite em arquivo único, fora de data/.
+SEQUENCES_DB = os.environ.get('SEQUENCES_DB') or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'instance', 'sequences.db')
+_db_existed = os.path.exists(SEQUENCES_DB)
+_startup_conn = sequences.init_db(SEQUENCES_DB)
+_legacy_seeds = sequences.seed_legacy(_startup_conn)
+_startup_conn.close()
+app.logger.setLevel(logging.INFO)
+app.logger.info(
+    'Sequences DB: %s (%s); legacy seeds guaranteed: %d',
+    SEQUENCES_DB, 'existing' if _db_existed else 'new', _legacy_seeds)
+
+
+def get_seq_db():
+    """Abre uma conexão por request (segura para o dev server multithread)."""
+    db = getattr(g, 'seq_db', None)
+    if db is None:
+        db = g.seq_db = sequences.connect(SEQUENCES_DB)
+    return db
+
+
+@app.teardown_appcontext
+def close_seq_db(exception):
+    db = g.pop('seq_db', None)
+    if db is not None:
+        db.close()
 
 
 @app.route('/')
@@ -163,6 +187,32 @@ def get_generos():
 def get_acordes():
     return json.dumps(list(acordes))
 
+@app.route('/sequencias', methods=['GET', 'POST'])
+def sequencias_catalogo():
+    conn = get_seq_db()
+
+    if request.method == 'POST':
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return json.dumps({'error': 'corpo JSON inválido'}), 400
+
+        name = payload.get('name')
+        chords = payload.get('chords')
+        if isinstance(chords, str):
+            try:
+                chords = sequences.parse_chords_csv(chords)
+            except sequences.SequenceValidationError as exc:
+                return json.dumps({'error': str(exc)}), 400
+
+        try:
+            sequencia, criada = sequences.create_sequence(conn, name, chords)
+        except sequences.SequenceValidationError as exc:
+            return json.dumps({'error': str(exc)}), 400
+
+        return json.dumps(sequencia), 201 if criada else 200
+
+    return json.dumps(sequences.list_sequences(conn))
+
 @app.route('/musica/<m_id>/')
 def get_musica(m_id):
     return json.dumps(musicas[m_id].__dict__)
@@ -188,13 +238,19 @@ def get_similares():
         musica = musicas[id_musica_tag]
         acordes = musica.acordes
     elif sequencia_tag:
-        acordes = sequencia_tag.replace(',','')
-        similares = []
+        sequencia = sequences.resolve_sequence(get_seq_db(), sequencia_tag)
+        if sequencia is None:
+            return json.dumps([])
 
-        if acordes in sequencias:
-            id_seq = sequencias[acordes]
-            similares = get_pagina(get_similares_por_sequencia(id_seq, generos_key), pagina_tag)
-        return json.dumps(similares)
+        if sequencia['match_mode'] == 'legacy':
+            similares = get_similares_por_sequencia(
+                sequencia['legacy_id'], generos_key)
+        else:
+            collection = apply_filtro(musicas.values(), generos_key)
+            similares = sequences.exact_matches(
+                collection, sequencia['chords'])
+
+        return json.dumps(get_pagina(similares, pagina_tag))
 
     similares = get_similares(acordes, generos_key, id_musica_tag)
 
